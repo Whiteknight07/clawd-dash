@@ -1,30 +1,11 @@
 import json
 import subprocess
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from textual.widgets import Static
 
 CRON_COMMAND = ["moltbot", "cron", "list", "--json"]
-
-
-PLACEHOLDER_JOBS = [
-    {
-        "name": "daily_summary",
-        "schedule": "0 7 * * *",
-        "next_run": "2026-01-30T07:00:00Z",
-    },
-    {
-        "name": "sync_memory",
-        "schedule": "*/15 * * * *",
-        "next_run": "2026-01-29T14:15:00Z",
-    },
-    {
-        "name": "nightly_cleanup",
-        "schedule": "30 2 * * *",
-        "next_run": "2026-01-30T02:30:00Z",
-    },
-]
 
 
 def _run_command(command: list[str]) -> Optional[str]:
@@ -34,28 +15,28 @@ def _run_command(command: list[str]) -> Optional[str]:
             capture_output=True,
             text=True,
             check=True,
-            timeout=2,
+            timeout=8,
         )
     except (subprocess.SubprocessError, FileNotFoundError):
         return None
     return result.stdout.strip() or None
 
 
-def _load_jobs() -> List[Dict[str, Any]]:
+def _load_jobs() -> Tuple[List[Dict[str, Any]], Optional[str]]:
     output = _run_command(CRON_COMMAND)
     if not output:
-        return PLACEHOLDER_JOBS
+        return [], "moltbot cron list --json failed"
     try:
         data = json.loads(output)
     except json.JSONDecodeError:
-        return PLACEHOLDER_JOBS
+        return [], "invalid JSON from moltbot cron list"
     if isinstance(data, dict) and "jobs" in data:
         jobs = data["jobs"]
     else:
         jobs = data
     if not isinstance(jobs, list):
-        return PLACEHOLDER_JOBS
-    return jobs
+        return [], "unexpected cron payload"
+    return jobs, None
 
 
 def _parse_datetime(value: str) -> Optional[datetime]:
@@ -69,6 +50,41 @@ def _parse_datetime(value: str) -> Optional[datetime]:
         return None
 
 
+def _parse_epoch(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.isdigit():
+        value = int(value)
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 1e12:
+            timestamp /= 1000.0
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    if isinstance(value, str):
+        return _parse_datetime(value)
+    return None
+
+
+def _extract_next_run(job: Dict[str, Any]) -> Optional[datetime]:
+    state = job.get("state") or {}
+    for key in ("nextRunAtMs", "next_run_at_ms", "nextRunAt", "next_run_at", "next"):
+        if key in state:
+            return _parse_epoch(state[key])
+    schedule = job.get("schedule") or {}
+    if isinstance(schedule, dict):
+        if schedule.get("kind") == "at":
+            for key in ("atMs", "at", "at_ms"):
+                if key in schedule:
+                    return _parse_epoch(schedule[key])
+        for key in ("nextRunAtMs", "nextRunAt", "next"):
+            if key in schedule:
+                return _parse_epoch(schedule[key])
+    for key in ("nextRunAtMs", "nextRunAt", "next_run", "next"):
+        if key in job:
+            return _parse_epoch(job[key])
+    return None
+
+
 def _format_countdown(target: Optional[datetime]) -> str:
     if not target:
         return "unknown"
@@ -80,6 +96,9 @@ def _format_countdown(target: Optional[datetime]) -> str:
         return "due"
     minutes, seconds = divmod(delta, 60)
     hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f"{days}d {hours}h"
     if hours:
         return f"{hours}h {minutes}m"
     if minutes:
@@ -93,18 +112,28 @@ class CronJobsPanel(Static):
         self.border_title = "Cron Jobs"
 
     def refresh_panel(self) -> None:
-        jobs = _load_jobs()
+        jobs, error = _load_jobs()
+        if error:
+            self.update(f"[bold #ff6b6b]Cron load failed[/]\n{error}")
+            return
         parsed: List[Dict[str, Any]] = []
         for job in jobs:
             name = str(job.get("name") or job.get("id") or "job")
-            schedule = str(job.get("schedule") or job.get("cron") or "-")
-            next_run = job.get("next_run") or job.get("next") or job.get("nextRun")
+            schedule = job.get("schedule") or job.get("cron")
+            schedule_text = "-"
+            if isinstance(schedule, dict):
+                if schedule.get("kind") == "cron":
+                    schedule_text = str(schedule.get("expr") or schedule.get("cron") or "-")
+                elif schedule.get("kind") == "at":
+                    schedule_text = "at"
+            elif schedule:
+                schedule_text = str(schedule)
+            next_dt = _extract_next_run(job)
             parsed.append(
                 {
                     "name": name,
-                    "schedule": schedule,
-                    "next_run": next_run,
-                    "next_dt": _parse_datetime(str(next_run)) if next_run else None,
+                    "schedule": schedule_text,
+                    "next_dt": next_dt,
                 }
             )
 
@@ -117,8 +146,9 @@ class CronJobsPanel(Static):
             "",
         ]
         for job in parsed[:5]:
+            per_job = _format_countdown(job["next_dt"])
             lines.append(
-                f"[bold #c8f7c5]{job['name']}[/] · {job['schedule']}"
+                f"[bold #c8f7c5]{job['name']}[/] · {per_job}"
             )
 
         if len(lines) <= 2:
